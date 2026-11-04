@@ -10,7 +10,7 @@ import numpy as np
 from ragas.prompt import PydanticPrompt
 from ragas.testset.graph import KnowledgeGraph, Node
 from ragas.testset.persona import Persona
-from ragas.testset.synthesizers.base import BaseScenario
+from ragas.testset.synthesizers.base import BaseScenario, gather_limited, wave_size
 from ragas.testset.synthesizers.prompts import (
     ThemesPersonasInput,
     ThemesPersonasMatchingPrompt,
@@ -135,10 +135,8 @@ class SingleHopSpecificQuerySynthesizer(SingleHopQuerySynthesizer):
             raise ValueError("No nodes found with the `entities` property.")
         samples_per_node = int(np.ceil(n / len(nodes)))
 
-        scenarios = []
+        candidates = []
         for node in nodes:
-            if len(scenarios) >= n:
-                break
             raw_themes = node.properties.get(self.property_name, [])
             # Extract themes from potentially mixed data types (handles tuples, lists, strings)
             themes = self._extract_themes_from_items(raw_themes)
@@ -146,17 +144,39 @@ class SingleHopSpecificQuerySynthesizer(SingleHopQuerySynthesizer):
             if not themes:  # Skip if no themes extracted
                 logger.debug("No themes extracted from node %s. Skipping.", node.id)
                 continue
+            candidates.append((node, themes))
 
-            prompt_input = ThemesPersonasInput(themes=themes, personas=persona_list)
-            persona_concepts = await self.theme_persona_matching_prompt.generate(
-                data=prompt_input, llm=self.llm, callbacks=callbacks
+        # Each node adds at most samples_per_node scenarios, so the next wave only
+        # asks for the nodes that are still needed. The prompts of a wave are
+        # independent, so they run together and can share a batch.
+        scenarios = []
+        position = 0
+        while len(scenarios) < n and position < len(candidates):
+            size = wave_size(n - len(scenarios), samples_per_node)
+            wave = candidates[position : position + size]
+            position += size
+            matches = await gather_limited(
+                self.llm,
+                [
+                    self.theme_persona_matching_prompt.generate(
+                        data=ThemesPersonasInput(themes=themes, personas=persona_list),
+                        llm=self.llm,
+                        callbacks=callbacks,
+                    )
+                    for _, themes in wave
+                ],
             )
-            base_scenarios = self.prepare_combinations(
-                node,
-                themes,
-                personas=persona_list,
-                persona_concepts=persona_concepts.mapping,
-            )
-            scenarios.extend(self.sample_combinations(base_scenarios, samples_per_node))
+            for (node, themes), persona_concepts in zip(wave, matches):
+                if len(scenarios) >= n:
+                    break
+                base_scenarios = self.prepare_combinations(
+                    node,
+                    themes,
+                    personas=persona_list,
+                    persona_concepts=persona_concepts.mapping,
+                )
+                scenarios.extend(
+                    self.sample_combinations(base_scenarios, samples_per_node)
+                )
 
         return scenarios

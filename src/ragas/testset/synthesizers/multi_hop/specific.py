@@ -10,6 +10,7 @@ import numpy as np
 from ragas.prompt import PydanticPrompt
 from ragas.testset.graph import KnowledgeGraph
 from ragas.testset.persona import Persona
+from ragas.testset.synthesizers.base import gather_limited, wave_size
 from ragas.testset.synthesizers.multi_hop.base import (
     MultiHopQuerySynthesizer,
     MultiHopScenario,
@@ -76,42 +77,63 @@ class MultiHopSpecificQuerySynthesizer(MultiHopQuerySynthesizer):
         num_sample_per_cluster = int(np.ceil(n / len(triplets)))
         scenarios = []
 
-        for triplet in triplets:
-            if len(scenarios) < n:
-                node_a, node_b = triplet[0], triplet[-1]
+        # Each triplet adds at most num_sample_per_cluster scenarios, so a wave only
+        # takes the triplets still needed. The prompts of a wave are independent, so
+        # they run together and can share a batch.
+        position = 0
+        while len(scenarios) < n and position < len(triplets):
+            size = wave_size(n - len(scenarios), num_sample_per_cluster)
+            wave = []
+            while position < len(triplets) and len(wave) < size:
+                triplet = triplets[position]
+                position += 1
                 overlapped_items = triplet[1].properties[self.relation_overlap_property]
-                if overlapped_items:
-                    if not all(
-                        isinstance(item, (str, Iterable)) for item in overlapped_items
-                    ):
-                        logger.debug("Overlapped items are not strings or iterables.")
-                        continue
-                    themes = self._extract_themes_from_overlaps(overlapped_items)
+                if not overlapped_items:
+                    continue
+                if not all(
+                    isinstance(item, (str, Iterable)) for item in overlapped_items
+                ):
+                    logger.debug("Overlapped items are not strings or iterables.")
+                    continue
+                wave.append(
+                    (
+                        triplet[0],
+                        triplet[-1],
+                        overlapped_items,
+                        self._extract_themes_from_overlaps(overlapped_items),
+                    )
+                )
 
-                    prompt_input = ThemesPersonasInput(
-                        themes=themes, personas=persona_list
+            matches = await gather_limited(
+                self.llm,
+                [
+                    self.theme_persona_matching_prompt.generate(
+                        data=ThemesPersonasInput(themes=themes, personas=persona_list),
+                        llm=self.llm,
+                        callbacks=callbacks,
                     )
-                    persona_concepts = (
-                        await self.theme_persona_matching_prompt.generate(
-                            data=prompt_input, llm=self.llm, callbacks=callbacks
-                        )
-                    )
-
-                    combinations = self._extract_theme_groups_from_overlaps(
-                        overlapped_items
-                    )
-
-                    base_scenarios = self.prepare_combinations(
-                        [node_a, node_b],
-                        combinations,
-                        personas=persona_list,
-                        persona_item_mapping=persona_concepts.mapping,
-                        property_name=self.property_name,
-                    )
-                    base_scenarios = self.sample_diverse_combinations(
-                        base_scenarios, num_sample_per_cluster
-                    )
-                    scenarios.extend(base_scenarios)
+                    for _, _, _, themes in wave
+                ],
+            )
+            for (node_a, node_b, overlapped_items, _), persona_concepts in zip(
+                wave, matches
+            ):
+                if len(scenarios) >= n:
+                    break
+                combinations = self._extract_theme_groups_from_overlaps(
+                    overlapped_items
+                )
+                base_scenarios = self.prepare_combinations(
+                    [node_a, node_b],
+                    combinations,
+                    personas=persona_list,
+                    persona_item_mapping=persona_concepts.mapping,
+                    property_name=self.property_name,
+                )
+                base_scenarios = self.sample_diverse_combinations(
+                    base_scenarios, num_sample_per_cluster
+                )
+                scenarios.extend(base_scenarios)
 
         return scenarios
 

@@ -103,6 +103,7 @@ nav:
               - Custom Single-hop Query: howtos/customizations/testgenerator/_testgen-custom-single-hop.md
               - Custom Multi-hop Query: howtos/customizations/testgenerator/_testgen-customisation.md
               - Using Pre-chunked Data: howtos/customizations/testgenerator/prechunked_data.md
+              - Batch Endpoints (Bulk LLM): howtos/customizations/testgenerator/bulk_llm.md
           - Optimizers:
               - DSPy Optimizer: howtos/customizations/optimizers/index.md
 

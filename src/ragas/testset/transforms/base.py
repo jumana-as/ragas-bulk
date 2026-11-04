@@ -3,7 +3,7 @@ import typing as t
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 
-from ragas.llms import BaseRagasLLM, llm_factory
+from ragas.llms import BaseRagasBulkLLM, BaseRagasLLM, llm_factory
 from ragas.prompt import PromptMixin
 from ragas.testset.graph import KnowledgeGraph, Node, Relationship
 from ragas.tokenizers import DEFAULT_TOKENIZER, BaseTokenizer
@@ -117,6 +117,17 @@ class BaseGraphTransformation(ABC):
         pass
 
 
+def _set_property(node: Node, property_name: str, property_value: t.Any) -> None:
+    if node.get_property(property_name) is None:
+        node.add_property(property_name, property_value)
+    else:
+        logger.warning(
+            "Property '%s' already exists in node '%.6s'. Skipping!",
+            property_name,
+            node.id,
+        )
+
+
 @dataclass
 class Extractor(BaseGraphTransformation):
     """
@@ -196,14 +207,7 @@ class Extractor(BaseGraphTransformation):
 
         async def apply_extract(node: Node):
             property_name, property_value = await self.extract(node)
-            if node.get_property(property_name) is None:
-                node.add_property(property_name, property_value)
-            else:
-                logger.warning(
-                    "Property '%s' already exists in node '%.6s'. Skipping!",
-                    property_name,
-                    node.id,
-                )
+            _set_property(node, property_name, property_value)
 
         filtered = self.filter(kg)
         plan = [apply_extract(node) for node in filtered.nodes]
@@ -223,6 +227,48 @@ class LLMBasedExtractor(Extractor, PromptMixin):
     merge_if_possible: bool = True
     max_token_limit: int = 32000
     tokenizer: BaseTokenizer = field(default_factory=lambda: DEFAULT_TOKENIZER)
+    # When set, all prompts go through this batch-endpoint LLM in one pass
+    # instead of one request per node through ``llm``.
+    bulk_llm: t.Optional[BaseRagasBulkLLM] = None
+    # By default one input that stays unusable after all retries fails the whole
+    # transform, as on the sync path. When False, that input gets an empty value
+    # (None for summaries, [] for lists) and the rest of the run is kept.
+    bulk_raise_exceptions: bool = True
+
+    async def transform(
+        self, kg: KnowledgeGraph
+    ) -> t.List[t.Tuple[Node, t.Tuple[str, t.Any]]]:
+        if self.bulk_llm is None:
+            return await super().transform(kg)
+        return await self.extract_bulk(self.filter(kg).nodes)
+
+    def generate_execution_plan(self, kg: KnowledgeGraph) -> t.Sequence[t.Coroutine]:
+        if self.bulk_llm is None:
+            return super().generate_execution_plan(kg)
+
+        nodes = self.filter(kg).nodes
+
+        async def apply_bulk():
+            for node, (property_name, property_value) in await self.extract_bulk(nodes):
+                _set_property(node, property_name, property_value)
+
+        return [apply_bulk()]
+
+    async def extract_bulk(
+        self, nodes: t.List[Node]
+    ) -> t.List[t.Tuple[Node, t.Tuple[str, t.Any]]]:
+        """
+        Extract the property for many nodes with one bulk pass over ``bulk_llm``.
+        Subclasses that support ``bulk_llm`` override this.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support bulk_llm"
+        )
+
+    def _require_bulk_llm(self) -> BaseRagasBulkLLM:
+        if self.bulk_llm is None:
+            raise ValueError(f"{self.__class__.__name__} has no bulk_llm set")
+        return self.bulk_llm
 
     def split_text_by_token_limit(self, text, max_token_limit):
         tokens = self.tokenizer.encode(text)

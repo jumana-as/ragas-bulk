@@ -29,12 +29,14 @@ from langchain_core.documents import Document as LCDocument
 
 from ragas.embeddings.base import BaseRagasEmbeddings
 from ragas.llms.base import BaseRagasLLM
+from ragas.llms.bulk import BaseRagasBulkLLM
 
 
 def default_transforms(
     documents: t.List[LCDocument],
     llm: t.Union[BaseRagasLLM, "InstructorBaseRagasLLM"],
     embedding_model: BaseRagasEmbeddings,
+    bulk_llm: t.Optional[BaseRagasBulkLLM] = None,
 ) -> "Transforms":
     """
     Creates and returns a default set of transforms for processing a knowledge graph.
@@ -89,14 +91,16 @@ def default_transforms(
         )
         splitter = HeadlineSplitter(min_tokens=500)
         summary_extractor = SummaryExtractor(
-            llm=llm, filter_nodes=lambda node: filter_doc_with_num_tokens(node)
+            llm=llm,
+            filter_nodes=lambda node: filter_doc_with_num_tokens(node),
+            bulk_llm=bulk_llm,
         )
 
         theme_extractor = ThemesExtractor(
-            llm=llm, filter_nodes=lambda node: filter_chunks(node)
+            llm=llm, filter_nodes=lambda node: filter_chunks(node), bulk_llm=bulk_llm
         )
         ner_extractor = NERExtractor(
-            llm=llm, filter_nodes=lambda node: filter_chunks(node)
+            llm=llm, filter_nodes=lambda node: filter_chunks(node), bulk_llm=bulk_llm
         )
 
         summary_emb_extractor = EmbeddingExtractor(
@@ -130,7 +134,9 @@ def default_transforms(
         ]
     elif result["101-500"] >= 0.25:
         summary_extractor = SummaryExtractor(
-            llm=llm, filter_nodes=lambda node: filter_doc_with_num_tokens(node, 100)
+            llm=llm,
+            filter_nodes=lambda node: filter_doc_with_num_tokens(node, 100),
+            bulk_llm=bulk_llm,
         )
         summary_emb_extractor = EmbeddingExtractor(
             embedding_model=embedding_model,
@@ -146,10 +152,10 @@ def default_transforms(
             filter_nodes=lambda node: filter_doc_with_num_tokens(node, 100),
         )
 
-        ner_extractor = NERExtractor(llm=llm)
+        ner_extractor = NERExtractor(llm=llm, bulk_llm=bulk_llm)
         ner_overlap_sim = OverlapScoreBuilder(threshold=0.01)
         theme_extractor = ThemesExtractor(
-            llm=llm, filter_nodes=lambda node: filter_docs(node)
+            llm=llm, filter_nodes=lambda node: filter_docs(node), bulk_llm=bulk_llm
         )
         node_filter = CustomNodeFilter(llm=llm)
 
@@ -170,6 +176,7 @@ def default_transforms(
 def default_transforms_for_prechunked(
     llm: t.Union[BaseRagasLLM, "InstructorBaseRagasLLM"],
     embedding_model: BaseRagasEmbeddings,
+    bulk_llm: t.Optional[BaseRagasBulkLLM] = None,
 ) -> "Transforms":
     """
     Creates and returns a default set of transforms for processing a knowledge graph
@@ -182,7 +189,9 @@ def default_transforms_for_prechunked(
     def filter_chunks(node):
         return node.type == NodeType.CHUNK
 
-    summary_extractor = SummaryExtractor(llm=llm, filter_nodes=filter_chunks)
+    summary_extractor = SummaryExtractor(
+        llm=llm, filter_nodes=filter_chunks, bulk_llm=bulk_llm
+    )
     summary_emb_extractor = EmbeddingExtractor(
         embedding_model=embedding_model,
         property_name="summary_embedding",
@@ -190,8 +199,10 @@ def default_transforms_for_prechunked(
         filter_nodes=filter_chunks,
     )
 
-    theme_extractor = ThemesExtractor(llm=llm, filter_nodes=filter_chunks)
-    ner_extractor = NERExtractor(llm=llm, filter_nodes=filter_chunks)
+    theme_extractor = ThemesExtractor(
+        llm=llm, filter_nodes=filter_chunks, bulk_llm=bulk_llm
+    )
+    ner_extractor = NERExtractor(llm=llm, filter_nodes=filter_chunks, bulk_llm=bulk_llm)
 
     cosine_sim_builder = CosineSimilarityBuilder(
         property_name="summary_embedding",

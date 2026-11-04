@@ -172,6 +172,30 @@ class SummaryExtractor(LLMBasedExtractor):
     property_name: str = "summary"
     prompt: SummaryExtractorPrompt = SummaryExtractorPrompt()
 
+    async def extract_bulk(
+        self, nodes: t.List[Node]
+    ) -> t.List[t.Tuple[Node, t.Tuple[str, t.Any]]]:
+        values: t.List[t.Optional[str]] = [None] * len(nodes)
+        inputs: t.List[StringIO] = []
+        owners: t.List[int] = []
+        for i, node in enumerate(nodes):
+            node_text = node.get_property("page_content")
+            if node_text is None:
+                continue
+            chunks = self.split_text_by_token_limit(node_text, self.max_token_limit)
+            inputs.append(StringIO(text=chunks[0]))
+            owners.append(i)
+
+        results = await self.prompt.generate_bulk(
+            self._require_bulk_llm(),
+            inputs,
+            raise_exceptions=self.bulk_raise_exceptions,
+        )
+        for i, result in zip(owners, results):
+            if result is not None:
+                values[i] = result.text
+        return [(node, (self.property_name, values[i])) for i, node in enumerate(nodes)]
+
     async def extract(self, node: Node) -> t.Tuple[str, t.Any]:
         node_text = node.get_property("page_content")
         if node_text is None:
@@ -286,6 +310,34 @@ class NERExtractor(LLMBasedExtractor):
     prompt: PydanticPrompt[TextWithExtractionLimit, NEROutput] = NERPrompt()
     max_num_entities: int = 10
 
+    async def extract_bulk(
+        self, nodes: t.List[Node]
+    ) -> t.List[t.Tuple[Node, t.Tuple[str, t.Any]]]:
+        values: t.List[t.List[str]] = [[] for _ in nodes]
+        inputs: t.List[TextWithExtractionLimit] = []
+        owners: t.List[int] = []
+        for i, node in enumerate(nodes):
+            node_text = node.get_property("page_content")
+            if node_text is None:
+                continue
+            for chunk in self.split_text_by_token_limit(
+                node_text, self.max_token_limit
+            ):
+                inputs.append(
+                    TextWithExtractionLimit(text=chunk, max_num=self.max_num_entities)
+                )
+                owners.append(i)
+
+        results = await self.prompt.generate_bulk(
+            self._require_bulk_llm(),
+            inputs,
+            raise_exceptions=self.bulk_raise_exceptions,
+        )
+        for i, result in zip(owners, results):
+            if result is not None:
+                values[i].extend(result.entities)
+        return [(node, (self.property_name, values[i])) for i, node in enumerate(nodes)]
+
     async def extract(self, node: Node) -> t.Tuple[str, t.List[str]]:
         node_text = node.get_property("page_content")
         if node_text is None:
@@ -392,6 +444,34 @@ class ThemesExtractor(LLMBasedExtractor):
     property_name: str = "themes"
     prompt: ThemesAndConceptsExtractorPrompt = ThemesAndConceptsExtractorPrompt()
     max_num_themes: int = 10
+
+    async def extract_bulk(
+        self, nodes: t.List[Node]
+    ) -> t.List[t.Tuple[Node, t.Tuple[str, t.Any]]]:
+        values: t.List[t.List[str]] = [[] for _ in nodes]
+        inputs: t.List[TextWithExtractionLimit] = []
+        owners: t.List[int] = []
+        for i, node in enumerate(nodes):
+            node_text = node.get_property("page_content")
+            if node_text is None:
+                continue
+            for chunk in self.split_text_by_token_limit(
+                node_text, self.max_token_limit
+            ):
+                inputs.append(
+                    TextWithExtractionLimit(text=chunk, max_num=self.max_num_themes)
+                )
+                owners.append(i)
+
+        results = await self.prompt.generate_bulk(
+            self._require_bulk_llm(),
+            inputs,
+            raise_exceptions=self.bulk_raise_exceptions,
+        )
+        for i, result in zip(owners, results):
+            if result is not None:
+                values[i].extend(result.output)
+        return [(node, (self.property_name, values[i])) for i, node in enumerate(nodes)]
 
     async def extract(self, node: Node) -> t.Tuple[str, t.List[str]]:
         node_text = node.get_property("page_content")
