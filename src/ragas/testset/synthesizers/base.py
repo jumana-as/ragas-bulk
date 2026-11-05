@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import asyncio
+import math
 import typing as t
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
@@ -18,6 +20,65 @@ if t.TYPE_CHECKING:
 
     from ragas.dataset_schema import BaseSample
     from ragas.llms.base import InstructorBaseRagasLLM
+
+_T = t.TypeVar("_T")
+
+#: Used when an LLM has no run config, matching ``RunConfig.max_workers``.
+DEFAULT_CONCURRENCY = 16
+
+
+def wave_size(remaining: int, per_item: int) -> int:
+    """
+    How many items to process together to produce ``remaining`` results.
+
+    Each item yields at most ``per_item`` results, so this many are needed anyway:
+    running them together makes no extra calls compared with running them one by one.
+    """
+    return max(1, math.ceil(remaining / max(1, per_item)))
+
+
+async def gather_limited(
+    llm: t.Any, awaitables: t.Sequence[t.Awaitable[_T]]
+) -> t.List[_T]:
+    """
+    Run independent LLM calls concurrently and return their results in order.
+
+    At most ``llm.run_config.max_workers`` run at once (all of them when it is
+    -1). The first failure cancels the rest and is raised.
+
+    Calls that are awaited one after another cannot share a batch on a bulk LLM,
+    so scenario generation issues the prompts of a wave through this helper.
+    """
+    if not awaitables:
+        return []
+    limit = getattr(
+        getattr(llm, "run_config", None), "max_workers", DEFAULT_CONCURRENCY
+    )
+    semaphore = asyncio.Semaphore(limit) if limit and limit > 0 else None
+
+    async def run(awaitable: t.Awaitable[_T]) -> _T:
+        if semaphore is None:
+            return await awaitable
+        async with semaphore:
+            return await awaitable
+
+    tasks = [asyncio.ensure_future(run(a)) for a in awaitables]
+    try:
+        _, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    except asyncio.CancelledError:
+        pending = {task for task in tasks if not task.done()}
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        raise
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
+    for task in tasks:
+        if not task.cancelled() and task.exception() is not None:
+            raise t.cast(BaseException, task.exception())
+    return [task.result() for task in tasks]
 
 
 def _default_llm_factory() -> t.Union[BaseRagasLLM, "InstructorBaseRagasLLM"]:

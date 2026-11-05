@@ -24,6 +24,8 @@ from .utils import extract_json, get_all_strings, update_strings
 if t.TYPE_CHECKING:
     from langchain_core.callbacks import Callbacks
 
+    from ragas.llms.bulk import BaseRagasBulkLLM
+
 from ragas.llms.base import BaseRagasLLM, InstructorBaseRagasLLM
 
 
@@ -354,6 +356,113 @@ class PydanticPrompt(BasePrompt, t.Generic[InputModel, OutputModel]):
     def process_output(self, output: OutputModel, input: InputModel) -> OutputModel:
         return output
 
+    @t.overload
+    async def generate_bulk(
+        self,
+        bulk_llm: BaseRagasBulkLLM,
+        inputs: t.Sequence[InputModel],
+        retries_left: int = ...,
+        *,
+        raise_exceptions: t.Literal[True] = ...,
+    ) -> t.List[OutputModel]: ...
+
+    @t.overload
+    async def generate_bulk(
+        self,
+        bulk_llm: BaseRagasBulkLLM,
+        inputs: t.Sequence[InputModel],
+        retries_left: int = ...,
+        *,
+        raise_exceptions: bool,
+    ) -> t.List[t.Optional[OutputModel]]: ...
+
+    async def generate_bulk(
+        self,
+        bulk_llm: BaseRagasBulkLLM,
+        inputs: t.Sequence[InputModel],
+        retries_left: int = 3,
+        *,
+        raise_exceptions: bool = True,
+    ) -> t.Union[t.List[OutputModel], t.List[t.Optional[OutputModel]]]:
+        """
+        Run this prompt on every input through a bulk (batch endpoint) LLM.
+
+        Inputs whose prompt text is identical are sent once. The custom_id of a
+        request is the prompt name plus a hash of its text, so reruns produce the
+        same ids and the checkpoint can match them.
+
+        A response that does not parse is sent back through the bulk LLM with the
+        fix-output-format prompt, up to ``retries_left`` times, as the sync path
+        does. Fix rounds use ids that include the round number, so an identical
+        fix prompt is not answered from the dedupe cache.
+
+        An input that still has no usable output after all retries makes the call
+        raise :class:`RagasOutputParserException` (or the bulk LLM's
+        :class:`BulkGenerationError`), like the sync path. With
+        ``raise_exceptions=False`` its result is None instead. Either way, its
+        cached answers are discarded from the bulk LLM, so a rerun asks the model
+        again instead of replaying the same bad answer.
+        """
+        prompts = [self.to_string(data) for data in inputs]
+        ids = [
+            f"{self.name}:{hashlib.sha256(prompt.encode('utf-8')).hexdigest()}"
+            for prompt in prompts
+        ]
+        unique: t.Dict[str, str] = {}
+        for cid, prompt in zip(ids, prompts):
+            unique.setdefault(cid, prompt)
+
+        parsed: t.Dict[str, OutputModel] = {}
+        failed: t.Set[str] = set()
+        asked: t.Dict[str, t.List[str]] = {cid: [] for cid in unique}
+        pending: t.Dict[str, str] = dict(unique)
+        for round_no in range(retries_left + 1):
+            cids = list(pending)
+            round_ids = [
+                cid if round_no == 0 else f"{cid}:fix{round_no}" for cid in cids
+            ]
+            for cid, round_id in zip(cids, round_ids):
+                asked[cid].append(round_id)
+            responses = await bulk_llm.generate_bulk(
+                [pending[cid] for cid in cids],
+                custom_ids=round_ids,
+                raise_exceptions=raise_exceptions,
+            )
+            next_pending: t.Dict[str, str] = {}
+            for cid, response in zip(cids, responses):
+                if response is None:
+                    failed.add(cid)
+                    continue
+                text = response
+                if round_no > 0:
+                    text = _unwrap_fixed_output(text)
+                try:
+                    parsed[cid] = self.output_model.model_validate_json(
+                        extract_json(text)
+                    )
+                except ValueError:
+                    next_pending[cid] = fix_output_format_prompt.to_string(
+                        OutputStringAndPrompt(
+                            output_string=text, prompt_value=unique[cid]
+                        )
+                    )
+            if round_no == retries_left:
+                failed.update(next_pending)
+                break
+            if not next_pending:
+                break
+            pending = next_pending
+
+        if failed:
+            bulk_llm.discard(round_id for cid in failed for round_id in asked[cid])
+            if raise_exceptions:
+                raise RagasOutputParserException()
+
+        return [
+            None if cid in failed else self.process_output(parsed[cid], data)
+            for cid, data in zip(ids, inputs)
+        ]
+
     async def adapt(
         self,
         target_language: str,
@@ -520,6 +629,14 @@ class FixOutputFormat(PydanticPrompt[OutputStringAndPrompt, StringIO]):
 
 
 fix_output_format_prompt = FixOutputFormat()
+
+
+def _unwrap_fixed_output(text: str) -> str:
+    """Return the text of a fix-output-format answer, or the raw text if it is not wrapped."""
+    try:
+        return StringIO.model_validate_json(extract_json(text)).text
+    except ValueError:
+        return text
 
 
 class RagasOutputParser(PydanticOutputParser[OutputModel]):

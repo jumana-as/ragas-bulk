@@ -3,8 +3,9 @@ from __future__ import annotations
 import logging
 import random
 import typing as t
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
+import numpy as np
 from langchain_core.callbacks import BaseCallbackManager
 from langchain_core.documents import Document as LCDocument
 
@@ -17,7 +18,13 @@ from ragas.embeddings.base import (
     LlamaIndexEmbeddingsWrapper,
 )
 from ragas.executor import Executor
-from ragas.llms import BaseRagasLLM, LangchainLLMWrapper, LlamaIndexLLMWrapper
+from ragas.llms import (
+    BaseRagasBulkLLM,
+    BaseRagasLLM,
+    BulkLLMAdapter,
+    LangchainLLMWrapper,
+    LlamaIndexLLMWrapper,
+)
 from ragas.run_config import RunConfig
 from ragas.testset.graph import KnowledgeGraph, Node, NodeType
 from ragas.testset.persona import Persona, generate_personas_from_kg
@@ -49,6 +56,44 @@ if t.TYPE_CHECKING:
 
 RAGAS_TESTSET_GENERATION_GROUP_NAME = "ragas testset generation"
 logger = logging.getLogger(__name__)
+
+#: A bulk LLM, or a BulkLLMAdapter around one to tune how calls are collected.
+BulkLLMArg = t.Union[BaseRagasBulkLLM, BulkLLMAdapter]
+
+
+def _bulk_adapter(
+    bulk_llm: BulkLLMArg,
+) -> t.Tuple[BulkLLMAdapter, BaseRagasBulkLLM]:
+    if isinstance(bulk_llm, BulkLLMAdapter):
+        return bulk_llm, bulk_llm.bulk_llm
+    return BulkLLMAdapter(bulk_llm), bulk_llm
+
+
+def _bulk_run_config(run_config: t.Optional[RunConfig]) -> RunConfig:
+    """
+    Run config with no cap on concurrent tasks.
+
+    A bulk LLM fills a batch from the tasks that are running at the same time, so
+    a cap of 16 workers would limit every batch to 16 prompts.
+    """
+    return replace(run_config or RunConfig(), max_workers=-1)
+
+
+def _bulk_for_transforms(
+    bulk_llm: t.Optional[BulkLLMArg],
+    transforms_llm: t.Any,
+    transforms_bulk_llm: t.Optional[BaseRagasBulkLLM],
+) -> t.Tuple[t.Optional[BulkLLMAdapter], t.Optional[BaseRagasBulkLLM]]:
+    """LLM and bulk LLM for the default transforms when ``bulk_llm`` is set."""
+    if bulk_llm is None:
+        return None, transforms_bulk_llm
+    if transforms_llm is not None:
+        raise ValueError(
+            "transforms_llm cannot be used together with bulk_llm, which runs every "
+            "LLM call of the generation."
+        )
+    adapter, bulk = _bulk_adapter(bulk_llm)
+    return adapter, transforms_bulk_llm or bulk
 
 
 @dataclass
@@ -125,6 +170,8 @@ class TestsetGenerator:
         with_debugging_logs=False,
         raise_exceptions: bool = True,
         return_executor: bool = False,
+        transforms_bulk_llm: t.Optional[BaseRagasBulkLLM] = None,
+        bulk_llm: t.Optional[BulkLLMArg] = None,
     ) -> t.Union[Testset, Executor]:
         """
         Generates an evaluation dataset based on given Langchain documents and parameters.
@@ -158,6 +205,17 @@ class TestsetGenerator:
             If True, returns the Executor instance instead of running generation.
             The returned executor can be used to cancel execution by calling executor.cancel().
             To get results, call executor.results(). Default is False.
+        transforms_bulk_llm : Optional[BaseRagasBulkLLM], optional
+            Bulk LLM for the default per-chunk extractors (summary, themes, NER). Their
+            requests are submitted as batches. Cannot be combined with `transforms`.
+            By default None.
+        bulk_llm : Optional[Union[BaseRagasBulkLLM, BulkLLMAdapter]], optional
+            Bulk LLM that runs every LLM call of the generation as batches: extraction,
+            personas, scenarios and samples. Cannot be combined with `transforms_llm` or
+            `return_executor`. It also fills `transforms_bulk_llm` when that is not set.
+            Each stage waits for its batches, and the stages depend on each other, so
+            expect several batch round trips. Pass a `BulkLLMAdapter` to tune how calls
+            are collected (`collect_window`, `send_temperature`). By default None.
 
         Returns
         -------
@@ -183,11 +241,19 @@ class TestsetGenerator:
                 """An embedding client was not provided. Provide an embedding through the transforms_embedding_model parameter. Alternatively you can provide your own transforms through the `transforms` parameter."""
             )
 
+        if transforms is not None and transforms_bulk_llm is not None:
+            raise ValueError(
+                "transforms_bulk_llm cannot be used together with transforms. Pass the bulk LLM to your own transforms instead."
+            )
+        bulk_transforms_llm, transforms_bulk_llm = _bulk_for_transforms(
+            bulk_llm, transforms_llm, transforms_bulk_llm
+        )
         if not transforms:
             transforms = default_transforms(
                 documents=list(documents),
-                llm=transforms_llm or self.llm,
+                llm=bulk_transforms_llm or transforms_llm or self.llm,
                 embedding_model=transforms_embedding_model or self.embedding_model,
+                bulk_llm=transforms_bulk_llm,
             )
 
         # convert the documents to Ragas nodes
@@ -205,7 +271,13 @@ class TestsetGenerator:
         kg = KnowledgeGraph(nodes=nodes)
 
         # apply transforms and update the knowledge graph
-        apply_transforms(kg, transforms, run_config=run_config or RunConfig())
+        apply_transforms(
+            kg,
+            transforms,
+            run_config=_bulk_run_config(run_config)
+            if bulk_llm is not None
+            else run_config or RunConfig(),
+        )
         self.knowledge_graph = kg
 
         return self.generate(
@@ -217,6 +289,7 @@ class TestsetGenerator:
             with_debugging_logs=with_debugging_logs,
             raise_exceptions=raise_exceptions,
             return_executor=return_executor,
+            bulk_llm=bulk_llm,
         )
 
     def generate_with_llamaindex_docs(
@@ -232,6 +305,8 @@ class TestsetGenerator:
         token_usage_parser: t.Optional[TokenUsageParser] = None,
         with_debugging_logs=False,
         raise_exceptions: bool = True,
+        transforms_bulk_llm: t.Optional[BaseRagasBulkLLM] = None,
+        bulk_llm: t.Optional[BulkLLMArg] = None,
     ):
         """
         Generates an evaluation dataset based on given scenarios and parameters.
@@ -249,9 +324,18 @@ class TestsetGenerator:
                 "An embedding client was not provided. Provide an embedding through the transforms_embedding_model parameter. Alternatively you can provide your own transforms through the `transforms` parameter."
             )
 
+        if transforms is not None and transforms_bulk_llm is not None:
+            raise ValueError(
+                "transforms_bulk_llm cannot be used together with transforms. Pass the bulk LLM to your own transforms instead."
+            )
+        bulk_transforms_llm, transforms_bulk_llm = _bulk_for_transforms(
+            bulk_llm, transforms_llm, transforms_bulk_llm
+        )
         if not transforms:
             # use TestsetGenerator's LLM and embedding model if no transforms_llm or transforms_embedding_model is provided
-            if transforms_llm is None:
+            if bulk_transforms_llm is not None:
+                llm_for_transforms = bulk_transforms_llm
+            elif transforms_llm is None:
                 llm_for_transforms = self.llm
             else:
                 llm_for_transforms = LlamaIndexLLMWrapper(transforms_llm)
@@ -267,6 +351,7 @@ class TestsetGenerator:
                 documents=[LCDocument(page_content=doc.text) for doc in documents],
                 llm=llm_for_transforms,
                 embedding_model=embedding_model_for_transforms,
+                bulk_llm=transforms_bulk_llm,
             )
 
         # convert the documents to Ragas nodes
@@ -285,7 +370,11 @@ class TestsetGenerator:
         kg = KnowledgeGraph(nodes=nodes)
 
         # apply transforms and update the knowledge graph
-        apply_transforms(kg, transforms, run_config)
+        apply_transforms(
+            kg,
+            transforms,
+            _bulk_run_config(run_config) if bulk_llm is not None else run_config,
+        )
         self.knowledge_graph = kg
 
         return self.generate(
@@ -297,6 +386,7 @@ class TestsetGenerator:
             with_debugging_logs=with_debugging_logs,
             raise_exceptions=raise_exceptions,
             return_executor=False,  # Default value for llamaindex_docs method
+            bulk_llm=bulk_llm,
         )
 
     def generate_with_chunks(
@@ -313,6 +403,8 @@ class TestsetGenerator:
         with_debugging_logs=False,
         raise_exceptions: bool = True,
         return_executor: bool = False,
+        transforms_bulk_llm: t.Optional[BaseRagasBulkLLM] = None,
+        bulk_llm: t.Optional[BulkLLMArg] = None,
     ) -> t.Union[Testset, Executor]:
         """
         Generates an evaluation dataset based on provided pre-chunked documents.
@@ -348,6 +440,17 @@ class TestsetGenerator:
             Whether to raise exceptions during generation, by default True
         return_executor : bool, optional
             If True, returns the Executor instance instead of running generation.
+        transforms_bulk_llm : Optional[BaseRagasBulkLLM], optional
+            Bulk LLM for the default per-chunk extractors (summary, themes, NER). Their
+            requests are submitted as batches. Cannot be combined with `transforms`.
+            By default None.
+        bulk_llm : Optional[Union[BaseRagasBulkLLM, BulkLLMAdapter]], optional
+            Bulk LLM that runs every LLM call of the generation as batches: extraction,
+            personas, scenarios and samples. Cannot be combined with `transforms_llm` or
+            `return_executor`. It also fills `transforms_bulk_llm` when that is not set.
+            Each stage waits for its batches, and the stages depend on each other, so
+            expect several batch round trips. Pass a `BulkLLMAdapter` to tune how calls
+            are collected (`collect_window`, `send_temperature`). By default None.
 
         Returns
         -------
@@ -368,10 +471,18 @@ class TestsetGenerator:
                 """An embedding client was not provided. Provide an embedding through the transforms_embedding_model parameter. Alternatively you can provide your own transforms through the `transforms` parameter."""
             )
 
+        if transforms is not None and transforms_bulk_llm is not None:
+            raise ValueError(
+                "transforms_bulk_llm cannot be used together with transforms. Pass the bulk LLM to your own transforms instead."
+            )
+        bulk_transforms_llm, transforms_bulk_llm = _bulk_for_transforms(
+            bulk_llm, transforms_llm, transforms_bulk_llm
+        )
         if transforms is None:
             transforms = default_transforms_for_prechunked(
-                llm=transforms_llm or self.llm,
+                llm=bulk_transforms_llm or transforms_llm or self.llm,
                 embedding_model=transforms_embedding_model or self.embedding_model,
+                bulk_llm=transforms_bulk_llm,
             )
 
         # convert the chunks to Ragas nodes
@@ -397,7 +508,13 @@ class TestsetGenerator:
         kg = KnowledgeGraph(nodes=nodes)
 
         # apply transforms and update the knowledge graph
-        apply_transforms(kg, transforms, run_config=run_config or RunConfig())
+        apply_transforms(
+            kg,
+            transforms,
+            run_config=_bulk_run_config(run_config)
+            if bulk_llm is not None
+            else run_config or RunConfig(),
+        )
         self.knowledge_graph = kg
 
         return self.generate(
@@ -409,7 +526,77 @@ class TestsetGenerator:
             with_debugging_logs=with_debugging_logs,
             raise_exceptions=raise_exceptions,
             return_executor=return_executor,
+            bulk_llm=bulk_llm,
         )
+
+    def _generate_with_bulk(
+        self,
+        bulk_llm: BulkLLMArg,
+        testset_size: int,
+        query_distribution: t.Optional[QueryDistribution],
+        num_personas: int,
+        run_config: t.Optional[RunConfig],
+        batch_size: t.Optional[int],
+        callbacks: t.Optional[Callbacks],
+        token_usage_parser: t.Optional[TokenUsageParser],
+        with_debugging_logs: bool,
+        raise_exceptions: bool,
+        return_executor: bool,
+    ) -> Testset:
+        """Run persona, scenario and sample generation through a bulk LLM."""
+        if return_executor:
+            raise ValueError(
+                "return_executor cannot be used together with bulk_llm: batches run for "
+                "minutes or hours and cannot be cancelled."
+            )
+        run_config = _bulk_run_config(run_config)
+        adapter, _ = _bulk_adapter(bulk_llm)
+
+        # Scenario selection and shuffling are random. Seeding them makes a rerun ask
+        # the same prompts, so the checkpoint answers them instead of paying again.
+        random.seed(run_config.seed)
+        np.random.seed(run_config.seed)
+
+        if self.persona_list is None:
+            self.persona_list = generate_personas_from_kg(
+                llm=adapter,
+                kg=self.knowledge_graph,
+                num_personas=num_personas,
+                callbacks=callbacks or [],
+            )
+
+        # Synthesizers passed by the caller are rebound to the bulk LLM for this run.
+        rebound: t.List[t.Tuple[t.Any, t.Any]] = []
+        if query_distribution is None:
+            query_distribution = default_query_distribution(
+                adapter, self.knowledge_graph, self.llm_context
+            )
+        else:
+            for synthesizer, _ in query_distribution:
+                rebound.append((synthesizer, synthesizer.llm))
+                synthesizer.llm = adapter
+
+        # generate() applies run_config to self.llm; put it back afterwards.
+        previous_config = getattr(self.llm, "run_config", None)
+        try:
+            result = self.generate(
+                testset_size=testset_size,
+                query_distribution=query_distribution,
+                num_personas=num_personas,
+                run_config=run_config,
+                batch_size=batch_size,
+                callbacks=callbacks,
+                token_usage_parser=token_usage_parser,
+                with_debugging_logs=with_debugging_logs,
+                raise_exceptions=raise_exceptions,
+                return_executor=False,
+            )
+        finally:
+            for synthesizer, llm in rebound:
+                synthesizer.llm = llm
+            if previous_config is not None and isinstance(self.llm, BaseRagasLLM):
+                self.llm.set_run_config(previous_config)
+        return t.cast(Testset, result)
 
     def generate(
         self,
@@ -423,6 +610,7 @@ class TestsetGenerator:
         with_debugging_logs=False,
         raise_exceptions: bool = True,
         return_executor: bool = False,
+        bulk_llm: t.Optional[BulkLLMArg] = None,
     ) -> t.Union[Testset, Executor]:
         """
         Generate an evaluation dataset based on given scenarios and parameters.
@@ -454,6 +642,16 @@ class TestsetGenerator:
             If True, returns the Executor instance instead of running generation.
             The returned executor can be used to cancel execution by calling executor.cancel().
             To get results, call executor.results().
+        bulk_llm : Optional[Union[BaseRagasBulkLLM, BulkLLMAdapter]], optional
+            Run persona, scenario and sample generation through this bulk (batch
+            endpoint) LLM instead of ``llm``. Calls made at about the same time share
+            batches, and the number of concurrent workers is not capped. Pass a
+            `BulkLLMAdapter` to tune how calls are collected. Cannot be combined with
+            `return_executor`. The random seed of `run_config` seeds Python's and
+            NumPy's generators, so a rerun with the same checkpoint asks the same
+            prompts and is answered from it; change the seed to draw a new testset.
+            Leave `batch_size` unset, because it limits how many tasks run together.
+            By default None.
 
         Returns
         -------
@@ -470,6 +668,21 @@ class TestsetGenerator:
         4. Generate samples for each scenario.
         5. Compile the results into an EvaluationDataset.
         """
+        if bulk_llm is not None:
+            return self._generate_with_bulk(
+                bulk_llm,
+                testset_size=testset_size,
+                query_distribution=query_distribution,
+                num_personas=num_personas,
+                run_config=run_config,
+                batch_size=batch_size,
+                callbacks=callbacks,
+                token_usage_parser=token_usage_parser,
+                with_debugging_logs=with_debugging_logs,
+                raise_exceptions=raise_exceptions,
+                return_executor=return_executor,
+            )
+
         if run_config is not None:
             # Only BaseRagasLLM has set_run_config method, not InstructorBaseRagasLLM
             if isinstance(self.llm, BaseRagasLLM):

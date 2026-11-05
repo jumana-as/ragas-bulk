@@ -7,7 +7,16 @@ from ragas.llms.base import (
     LlamaIndexLLMWrapper as _LlamaIndexLLMWrapper,
     llm_factory,
 )
+from ragas.llms.bulk import (
+    BaseRagasBulkLLM,
+    BulkCheckpointMismatchError,
+    BulkGenerationError,
+    BulkLLMLimits,
+    BulkTransportError,
+)
+from ragas.llms.bulk_adapter import BulkLLMAdapter
 from ragas.llms.haystack_wrapper import HaystackLLMWrapper
+from ragas.llms.inline_batch import InlineBatchBulkLLM
 from ragas.llms.litellm_llm import LiteLLMStructuredLLM
 from ragas.llms.oci_genai_wrapper import OCIGenAIWrapper, oci_genai_factory
 from ragas.utils import DeprecationHelper
@@ -32,8 +41,15 @@ LlamaIndexLLMWrapper = DeprecationHelper(
 )
 
 __all__ = [
+    "BaseRagasBulkLLM",
     "BaseRagasLLM",
+    "BulkCheckpointMismatchError",
+    "BulkGenerationError",
+    "BulkLLMAdapter",
+    "BulkLLMLimits",
+    "BulkTransportError",
     "HaystackLLMWrapper",
+    "InlineBatchBulkLLM",
     "InstructorBaseRagasLLM",
     "InstructorLLM",
     "LangchainLLMWrapper",

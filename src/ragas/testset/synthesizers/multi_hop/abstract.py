@@ -9,6 +9,7 @@ import numpy as np
 from ragas.prompt import PydanticPrompt
 from ragas.testset.graph import KnowledgeGraph, Node
 from ragas.testset.persona import Persona
+from ragas.testset.synthesizers.base import gather_limited, wave_size
 from ragas.testset.synthesizers.multi_hop.base import (
     MultiHopQuerySynthesizer,
     MultiHopScenario,
@@ -88,51 +89,76 @@ class MultiHopAbstractQuerySynthesizer(MultiHopQuerySynthesizer):
             rel for rel in knowledge_graph.relationships if rel.type == "child"
         ]
 
-        for cluster in node_clusters:
-            if len(scenarios) >= n:
-                break
-            nodes = []
-            for node in cluster:
-                child_nodes = [
-                    rel.target for rel in child_relationships if rel.source == node
-                ]
-                if child_nodes:
-                    nodes.extend(child_nodes)
-                else:
-                    nodes.append(node)
+        # Each cluster adds at most num_sample_per_cluster scenarios, so a wave only
+        # takes the clusters still needed. The two prompts of a cluster depend on
+        # each other, but the clusters of a wave do not, so each step runs together.
+        position = 0
+        while len(scenarios) < n and position < len(node_clusters):
+            size = wave_size(n - len(scenarios), num_sample_per_cluster)
+            wave = []
+            for cluster in node_clusters[position : position + size]:
+                nodes = []
+                for node in cluster:
+                    child_nodes = [
+                        rel.target for rel in child_relationships if rel.source == node
+                    ]
+                    if child_nodes:
+                        nodes.extend(child_nodes)
+                    else:
+                        nodes.append(node)
+                wave.append(nodes)
+            position += size
 
-            base_scenarios = []
-            node_themes = [
-                node.properties.get(self.abstract_property_name, []) for node in nodes
-            ]
-            prompt_input = ConceptsList(
-                lists_of_concepts=node_themes, max_combinations=num_sample_per_cluster
+            combinations = await gather_limited(
+                self.llm,
+                [
+                    self.concept_combination_prompt.generate(
+                        data=ConceptsList(
+                            lists_of_concepts=[
+                                node.properties.get(self.abstract_property_name, [])
+                                for node in nodes
+                            ],
+                            max_combinations=num_sample_per_cluster,
+                        ),
+                        llm=self.llm,
+                        callbacks=callbacks,
+                    )
+                    for nodes in wave
+                ],
             )
-            concept_combination = await self.concept_combination_prompt.generate(
-                data=prompt_input, llm=self.llm, callbacks=callbacks
+            matches = await gather_limited(
+                self.llm,
+                [
+                    self.theme_persona_matching_prompt.generate(
+                        data=ThemesPersonasInput(
+                            themes=[
+                                theme
+                                for sublist in combination.combinations
+                                for theme in sublist
+                            ],
+                            personas=persona_list,
+                        ),
+                        llm=self.llm,
+                        callbacks=callbacks,
+                    )
+                    for combination in combinations
+                ],
             )
-            flattened_themes = [
-                theme
-                for sublist in concept_combination.combinations
-                for theme in sublist
-            ]
-            prompt_input = ThemesPersonasInput(
-                themes=flattened_themes, personas=persona_list
-            )
-            persona_concepts = await self.theme_persona_matching_prompt.generate(
-                data=prompt_input, llm=self.llm, callbacks=callbacks
-            )
-
-            base_scenarios = self.prepare_combinations(
-                nodes,
-                concept_combination.combinations,
-                personas=persona_list,
-                persona_item_mapping=persona_concepts.mapping,
-                property_name=self.abstract_property_name,
-            )
-            base_scenarios = self.sample_diverse_combinations(
-                base_scenarios, num_sample_per_cluster
-            )
-            scenarios.extend(base_scenarios)
+            for nodes, combination, persona_concepts in zip(
+                wave, combinations, matches
+            ):
+                if len(scenarios) >= n:
+                    break
+                base_scenarios = self.prepare_combinations(
+                    nodes,
+                    combination.combinations,
+                    personas=persona_list,
+                    persona_item_mapping=persona_concepts.mapping,
+                    property_name=self.abstract_property_name,
+                )
+                base_scenarios = self.sample_diverse_combinations(
+                    base_scenarios, num_sample_per_cluster
+                )
+                scenarios.extend(base_scenarios)
 
         return scenarios
